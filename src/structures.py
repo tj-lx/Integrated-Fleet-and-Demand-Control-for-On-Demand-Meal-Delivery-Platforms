@@ -1,17 +1,37 @@
-# === structures.py ===
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+@dataclass
+class Location:
+    x: float
+    y: float
+
+@dataclass
+class Order:
+    id: int
+    restaurant_id: int
+    customer_loc: Location
+    place_time: float
+    promised_time: float
+    ready_time: float = 0.0
+
 @dataclass
 class Stop:
-    loc: tuple      # (x, y)
-    type: int       # 0: Pickup (餐厅), 1: Delivery (客户)
-    time_window: float # 截止时间 (对于Pickup是0或备餐好时间，Delivery是承诺时间)
-    belongs_to_req: int # 属于哪个订单ID
+    loc: Location
+    type: str # 'pickup' or 'delivery'
+    order_id: int
+    estimated_arrival: float = 0.0
 
 @dataclass
 class Vehicle:
     id: int
-    loc: tuple
+    loc: Location
     route: List[Stop] = field(default_factory=list)
     next_free_time: float = 0.0
 
-    def current_load(self):
-        return len([s for s in self.route if s.type == 1])
+@dataclass
+class Restaurant:
+    id: int
+    loc: Location
+    # 论文中提到的特征：基本配送费，准备时间等，这里简化
+    base_score: float = 1.0

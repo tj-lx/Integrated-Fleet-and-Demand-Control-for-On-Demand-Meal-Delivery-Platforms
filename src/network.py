@@ -1,78 +1,84 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import config
 
-class IntegratedAttentionModel(nn.Module):
-    def __init__(self):
-        super().__init__()
+class QNetwork(nn.Module):
+    def __init__(self, num_restaurants, embedding_dim):
+        super(QNetwork, self).__init__()
         
-        # 1. Stop Embedding Layer (把单个站点的特征变成向量)
-        self.stop_embed = nn.Linear(config.FEATURE_DIM, config.HIDDEN_DIM)
+        # [cite_start]1. 特征编码层 (Stop Embedding) [cite: 568]
+        # 输入: [位置x, 位置y, 类型(0/1), 预估时间]
+        self.stop_encoder = nn.Linear(4, embedding_dim)
         
-        # 2. Route Attention Mechanism (聚合一辆车的所有站点)
-        # Query是车辆本身特征(简化为固定向量), Key/Value是Stop Embeddings
-        self.route_attn = nn.MultiheadAttention(config.HIDDEN_DIM, num_heads=4, batch_first=True)
-        self.route_query = nn.Parameter(torch.randn(1, 1, config.HIDDEN_DIM)) # Learnable Query
+        # [cite_start]2. 路线注意力机制 (Route Attention) [cite: 569]
+        # 将变长的路线压缩成固定向量
+        self.route_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=4, batch_first=True)
         
-        # 3. Fleet Attention Mechanism (聚合所有车辆)
-        self.fleet_attn = nn.MultiheadAttention(config.HIDDEN_DIM, num_heads=4, batch_first=True)
-        self.fleet_query = nn.Parameter(torch.randn(1, 1, config.HIDDEN_DIM))
+        # [cite_start]3. 车队注意力机制 (Fleet Attention) [cite: 571]
+        # 将变长的车队(多个路线)压缩成全局状态向量
+        self.fleet_attention = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=4, batch_first=True)
         
-        # 4. Context Embedding (当前客户和餐厅的特征)
-        self.context_embed = nn.Linear(4, config.HIDDEN_DIM) # [req_x, req_y, rest_x, rest_y]
-        
-        # 5. Dueling Heads (Value & Advantage)
-        # 输入: Fleet State + Context + Specific Vehicle Route
-        combined_dim = config.HIDDEN_DIM * 3 # Fleet + Route + Context
-        
-        self.val_fc = nn.Sequential(
-            nn.Linear(combined_dim, 64), nn.ReLU(), nn.Linear(64, 1)
+        # [cite_start]4. Dueling Head [cite: 577]
+        # Value Stream (State Value)
+        self.value_stream = nn.Sequential(
+            nn.Linear(embedding_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
         )
-        self.adv_fc = nn.Sequential(
-            nn.Linear(combined_dim, 64), nn.ReLU(), nn.Linear(64, 1)
+        
+        # Advantage Stream (Action Value for each Restaurant-Vehicle pair)
+        # 输入: State Embedding + Restaurant Embedding
+        self.rest_embedding = nn.Embedding(num_restaurants, embedding_dim)
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 64), # Fleet State + Rest Feature
+            nn.ReLU(),
+            nn.Linear(64, config.NUM_VEHICLES) # 输出每个车辆的Q值
         )
 
-    def forward(self, vehicles_stops, vehicles_mask, context):
+    def forward(self, fleet_states, restaurant_ids):
         """
-        vehicles_stops: [Batch, Num_Vehicles, Max_Stops, Feat_Dim]
-        vehicles_mask: [Batch, Num_Vehicles, Max_Stops] (1 for padding, 0 for data)
-        context: [Batch, 4] (当前处理的 Request + Restaurant 特征)
+        fleet_states: List of tensors, shape (Batch, Num_Vehicles, Max_Stops, 4)
+        restaurant_ids: (Batch, )
         """
-        B, N_V, MAX_S, F_D = vehicles_stops.shape
+        batch_size = restaurant_ids.size(0)
         
-        # === A. Route Attention (并行处理所有车辆) ===
-        # Reshape to [B * N_V, MAX_S, F_D]
-        stops_flat = vehicles_stops.view(B * N_V, MAX_S, F_D)
-        mask_flat = vehicles_mask.view(B * N_V, MAX_S)
+        # --- Step 1 & 2: Route Embedding ---
+        # 这里为了简化，假设输入已经是Padding好的Tensor
+        # 实际工程中需要处理变长序列 mask
+        # fleet_states: (B, N_Veh, N_Stops, 4)
         
-        # Embedding
-        x_stops = F.relu(self.stop_embed(stops_flat)) # [B*N_V, MAX_S, Hidden]
+        # 合并Batch和Vehicle维度进行处理
+        B, N, S, F = fleet_states.shape
+        x = fleet_states.view(B * N, S, F) 
         
-        # Attention Pooling -> Route Embeddings
-        # Query 广播到每个车辆
-        q_route = self.route_query.expand(B * N_V, 1, config.HIDDEN_DIM)
-        # key_padding_mask 需要 Bool Tensor (True 表示忽略)
-        route_emb, _ = self.route_attn(q_route, x_stops, x_stops, key_padding_mask=mask_flat.bool())
-        route_emb = route_emb.squeeze(1).view(B, N_V, config.HIDDEN_DIM) # [B, N_V, Hidden]
+        x = torch.relu(self.stop_encoder(x)) # (B*N, S, Emb)
         
-        # === B. Fleet Attention (聚合车队信息) ===
-        q_fleet = self.fleet_query.expand(B, 1, config.HIDDEN_DIM)
-        fleet_emb, _ = self.fleet_attn(q_fleet, route_emb, route_emb) # [B, 1, Hidden]
-        fleet_vec = fleet_emb.repeat(1, N_V, 1) # 广播回每个车辆用于计算Advantage [B, N_V, Hidden]
+        # Route Attention: Query=Key=Value=Stops
+        # 输出: (B*N, S, Emb) -> 取平均或池化得到 (B*N, Emb)
+        attn_out, _ = self.route_attention(x, x, x)
+        route_embeddings = attn_out.mean(dim=1) # (B*N, Emb)
         
-        # === C. Context Fusion ===
-        ctx_vec = F.relu(self.context_embed(context)).unsqueeze(1).expand(B, N_V, config.HIDDEN_DIM)
+        # --- Step 3: Fleet Embedding ---
+        # 恢复维度 (B, N, Emb)
+        fleet_input = route_embeddings.view(B, N, -1)
         
-        # === D. Dueling Network Calculation ===
-        # 我们需要评估每一辆车 v 的 Q值
-        # Input: [Fleet_Summary, Vehicle_v_Route_Summary, Context]
-        combined = torch.cat([fleet_vec, route_emb, ctx_vec], dim=-1) # [B, N_V, Hidden*3]
+        # Fleet Attention
+        fleet_out, _ = self.fleet_attention(fleet_input, fleet_input, fleet_input)
+        state_embedding = fleet_out.mean(dim=1) # (B, Emb) 全局状态
         
-        values = self.val_fc(combined) # State Value V(S)
-        advantages = self.adv_fc(combined) # Advantage A(S, v)
+        # --- Step 4: Dueling Heads ---
+        # V(s)
+        V = self.value_stream(state_embedding) # (B, 1)
         
-        # Q(S, v) = V(S) + A(S, v) - mean(A(S, .))
-        q_values = values + (advantages - advantages.mean(dim=1, keepdim=True))
+        # A(s, a)
+        # 获取当前正在决策的餐厅的Embedding
+        r_embed = self.rest_embedding(restaurant_ids) # (B, Emb)
         
-        return q_values.squeeze(-1) # [B, N_V]
+        # 将状态和餐厅特征结合
+        combined = torch.cat([state_embedding, r_embed], dim=1) # (B, Emb*2)
+        A = self.advantage_stream(combined) # (B, Num_Vehicles)
+        
+        # Q(s, r, v) = V(s) + A(s, r, v) - mean(A)
+        Q = V + A - A.mean(dim=1, keepdim=True)
+        
+        return Q

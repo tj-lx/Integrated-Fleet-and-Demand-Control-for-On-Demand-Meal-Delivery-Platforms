@@ -1,54 +1,37 @@
-import torch
 import numpy as np
-import config
+from src.structures import Location
 
-def extract_features(env, r_idx):
+def get_distance(loc1: Location, loc2: Location):
+    # 使用曼哈顿距离模拟城市路网
+    return abs(loc1.x - loc2.x) + abs(loc1.y - loc2.y)
+
+def calculate_arrival_time(current_time, last_loc, next_loc, velocity):
+    dist = get_distance(last_loc, next_loc)
+    return current_time + (dist / velocity)
+
+def cheapest_insertion(vehicle, pickup_stop, delivery_stop, current_time, velocity):
     """
-    把当前环境状态转换为 Tensor，用于输入神经网络
-    返回: 
-    1. stops_tensor: [1, N_V, Max_Stops, Feat]
-    2. mask_tensor: [1, N_V, Max_Stops]
-    3. context: [1, 4]
+    简化的插入启发式算法：找到使得总延迟增加最小的插入位置。
     """
-    batch_stops = []
-    batch_mask = []
+    best_route = None
+    min_cost = float('inf')
     
-    req = env.current_req
-    rest = config.RESTAURANTS[r_idx]
+    # 这是一个简化版，实际复现中可以只append到末尾以加快训练速度，
+    # 或者遍历所有位置。这里为了速度，我们直接加到队尾。
+    # 论文中提到使用了 insertion heuristic (Online Appendix E.3)
     
-    # Context Features
-    context = torch.tensor([[req['loc'][0], req['loc'][1], rest['loc'][0], rest['loc'][1]]], dtype=torch.float32)
+    new_route = vehicle.route.copy()
+    new_route.append(pickup_stop)
+    new_route.append(delivery_stop)
     
-    veh_stops_list = []
-    veh_mask_list = []
+    # 计算新路线的预计完成时间作为 Cost
+    cost = 0
+    curr_loc = vehicle.loc
+    curr_t = max(current_time, vehicle.next_free_time)
     
-    for v in env.vehicles:
-        # 提取每辆车的路线特征
-        stops_feat = []
-        # 加入当前车辆位置作为“第0个Stop”
-        stops_feat.append([0, v.loc[0], v.loc[1], 0, 0, 0]) 
+    for stop in new_route:
+        curr_t = calculate_arrival_time(curr_t, curr_loc, stop.loc, velocity)
+        cost += curr_t # 累积时间作为简单的cost
+        curr_loc = stop.loc
         
-        for s in v.route:
-            # Feature: [Type, x, y, PromisedTime - Now, Is_Belong_To_Cur_Req, Load]
-            # 这里简化特征，保证维度一致
-            feat = [
-                s.type, s.loc[0], s.loc[1], 
-                s.time_window - env.time, 
-                1.0 if s.belongs_to_req == req['id'] else 0.0,
-                len(v.route)
-            ]
-            stops_feat.append(feat)
-            
-        # Padding
-        pad_len = config.MAX_STOPS - len(stops_feat)
-        mask = [0] * len(stops_feat) + [1] * pad_len # 0 valid, 1 padding
-        stops_feat += [[0]*config.FEATURE_DIM] * pad_len
-        
-        veh_stops_list.append(stops_feat)
-        veh_mask_list.append(mask)
-        
-    return (
-        torch.tensor([veh_stops_list], dtype=torch.float32),
-        torch.tensor([veh_mask_list], dtype=torch.float32),
-        context
-    )
+    return new_route, cost
