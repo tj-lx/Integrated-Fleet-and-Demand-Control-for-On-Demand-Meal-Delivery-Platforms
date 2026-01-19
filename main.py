@@ -2,7 +2,7 @@ from src.environment import DeliveryEnvironment
 from src.agent import Agent
 import config
 import torch
-import random 
+import random
 
 def main():
     env = DeliveryEnvironment()

@@ -9,7 +9,7 @@ VELOCITY = 0.5         # 车速 0.5 km/min (30km/h)
 
 # 训练超参数
 BATCH_SIZE = 32
-LR = 1e-3
+LR = 1e-4
 GAMMA = 0.99           # 折扣因子
 EPSILON_START = 1.0
 EPSILON_END = 0.05
